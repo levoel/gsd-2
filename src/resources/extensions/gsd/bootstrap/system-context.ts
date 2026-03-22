@@ -65,12 +65,42 @@ export async function buildBeforeAgentStartResult(
   }
 
   let knowledgeBlock = "";
+  // Global knowledge (~/.gsd/KNOWLEDGE.md) — index with trigger-based detail files
+  const globalKnowledgePath = join(gsdHome, "KNOWLEDGE.md");
+  if (existsSync(globalKnowledgePath)) {
+    try {
+      const globalIndex = readFileSync(globalKnowledgePath, "utf-8").trim();
+      if (globalIndex) {
+        // Always include the lightweight index
+        knowledgeBlock += `\n\n[GLOBAL KNOWLEDGE — Cross-project rules, infrastructure, and context]\n\n${globalIndex}`;
+        // Parse trigger table rows: | Topic | File | Triggers |
+        const prompt = (event.prompt || "").toLowerCase();
+        const triggerRows = globalIndex.split("\n").filter(l => l.startsWith("|") && !l.includes("---") && !l.toLowerCase().includes("topic"));
+        for (const row of triggerRows) {
+          const cells = row.split("|").map(c => c.trim()).filter(Boolean);
+          if (cells.length >= 3) {
+            const filePath = cells[1].replace(/`/g, "").replace("~", homedir());
+            const triggers = cells[2].split(",").map(t => t.trim().toLowerCase());
+            if (triggers.some(t => t && prompt.includes(t)) && existsSync(filePath)) {
+              const detail = readFileSync(filePath, "utf-8").trim();
+              if (detail) {
+                knowledgeBlock += `\n\n${detail}`;
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // skip
+    }
+  }
+  // Project knowledge (.gsd/KNOWLEDGE.md) — project-specific
   const knowledgePath = resolveGsdRootFile(process.cwd(), "KNOWLEDGE");
-  if (existsSync(knowledgePath)) {
+  if (existsSync(knowledgePath) && knowledgePath !== globalKnowledgePath) {
     try {
       const content = readFileSync(knowledgePath, "utf-8").trim();
       if (content) {
-        knowledgeBlock = `\n\n[PROJECT KNOWLEDGE — Rules, patterns, and lessons learned]\n\n${content}`;
+        knowledgeBlock += `\n\n[PROJECT KNOWLEDGE — Rules, patterns, and lessons learned]\n\n${content}`;
       }
     } catch {
       // skip

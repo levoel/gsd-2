@@ -20,7 +20,8 @@ import type { GSDState, InlineLevel } from "./types.js";
 import type { GSDPreferences } from "./preferences.js";
 import { getLoadedSkills, type Skill } from "@gsd/pi-coding-agent";
 import { join, basename } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { computeBudgets, resolveExecutorContextWindow, truncateAtSectionBoundary } from "./context-budget.js";
 import { formatDecisionsCompact, formatRequirementsCompact } from "./structured-data-formatter.js";
 
@@ -1071,9 +1072,39 @@ export async function buildExecuteTaskPrompt(
     : priorSummaries;
   const carryForwardSection = await buildCarryForwardSection(effectivePriorSummaries, base);
 
+  // Inline global knowledge (~/.gsd/KNOWLEDGE.md) — index + trigger-based detail files
+  const gsdHome = process.env.GSD_HOME || join(homedir(), ".gsd");
+  const globalKnowledgePath = join(gsdHome, "KNOWLEDGE.md");
+  let globalKnowledgeContent: string | null = null;
+  if (existsSync(globalKnowledgePath)) {
+    try {
+      const gkRaw = readFileSync(globalKnowledgePath, "utf-8").trim();
+      if (gkRaw) {
+        const globalParts = [gkRaw];
+        // Parse trigger table and load matching detail files based on task/slice context
+        const context = `${tTitle} ${sTitle}`.toLowerCase();
+        const triggerRows = gkRaw.split("\n").filter(l => l.startsWith("|") && !l.includes("---") && !l.toLowerCase().includes("topic"));
+        for (const row of triggerRows) {
+          const cells = row.split("|").map(c => c.trim()).filter(Boolean);
+          if (cells.length >= 3) {
+            const filePath = cells[1].replace(/`/g, "").replace("~", homedir());
+            const triggers = cells[2].split(",").map(t => t.trim().toLowerCase());
+            if (triggers.some(t => t && context.includes(t)) && existsSync(filePath)) {
+              const detail = readFileSync(filePath, "utf-8").trim();
+              if (detail) globalParts.push(detail);
+            }
+          }
+        }
+        globalKnowledgeContent = `<inlined_file path="~/.gsd/KNOWLEDGE.md" title="Global Knowledge">\n${globalParts.join("\n\n---\n\n")}\n</inlined_file>`;
+      }
+    } catch {
+      // skip
+    }
+  }
+
   // Inline project knowledge if available (smart-chunked for relevance)
   const knowledgeAbsPath = resolveGsdRootFile(base, "KNOWLEDGE");
-  const knowledgeInlineET = existsSync(knowledgeAbsPath)
+  const knowledgeInlineET = (existsSync(knowledgeAbsPath) && knowledgeAbsPath !== globalKnowledgePath)
     ? await inlineFileSmart(
         knowledgeAbsPath,
         relGsdRootFile("KNOWLEDGE"),
@@ -1089,6 +1120,7 @@ export async function buildExecuteTaskPrompt(
     : [
         inlineTemplate("task-summary", "Task Summary"),
         inlineTemplate("decisions", "Decisions"),
+        ...(globalKnowledgeContent ? [globalKnowledgeContent] : []),
         ...(knowledgeContent ? [knowledgeContent] : []),
       ].join("\n\n---\n\n");
 
