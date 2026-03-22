@@ -1,4 +1,5 @@
 import type { AutocompleteProvider, CombinedAutocompleteProvider } from "../autocomplete.js";
+import type { EditorImageAttachment } from "../editor-component.js";
 import { getEditorKeybindings } from "../keybindings.js";
 import { decodeKittyPrintable, matchesKey } from "../keys.js";
 import { KillRing } from "../kill-ring.js";
@@ -160,6 +161,9 @@ export class Editor implements Component, Focusable {
 	private pastes: Map<number, string> = new Map();
 	private pasteCounter: number = 0;
 
+	// Image attachments (clipboard paste, drag-and-drop, etc.)
+	private imageAttachments: EditorImageAttachment[] = [];
+
 	// Bracketed paste mode buffering
 	private pasteBuffer: string = "";
 	private isInPaste: boolean = false;
@@ -185,7 +189,7 @@ export class Editor implements Component, Focusable {
 	private layoutCache: { width: number; textVersion: number; cursorLine: number; cursorCol: number; lines: LayoutLine[] } | null = null;
 	private visualLineMapCache: { width: number; textVersion: number; lines: VisualLine[] } | null = null;
 
-	public onSubmit?: (text: string) => void;
+	public onSubmit?: (text: string, images?: EditorImageAttachment[]) => void;
 	public onChange?: (text: string) => void;
 	public disableSubmit: boolean = false;
 
@@ -429,6 +433,18 @@ export class Editor implements Component, Focusable {
 			result.push(this.borderColor(indicator + "─".repeat(Math.max(0, remaining))));
 		} else {
 			result.push(horizontal.repeat(width));
+		}
+
+		// Add image attachment indicators
+		if (this.imageAttachments.length > 0) {
+			const count = this.imageAttachments.length;
+			const totalSize = this.imageAttachments.map(a => a.sizeLabel).join(" + ");
+			const label = count === 1
+				? `  📎 1 image attached (${totalSize})`
+				: `  📎 ${count} images attached (${totalSize})`;
+			const labelWidth = visibleWidth(label);
+			const labelPadding = " ".repeat(Math.max(0, width - labelWidth));
+			result.push(`\x1b[2m${label}${labelPadding}\x1b[22m`); // dim text
 		}
 
 		// Add autocomplete list if active
@@ -888,6 +904,43 @@ export class Editor implements Component, Focusable {
 		this.insertTextAtCursorInternal(text);
 	}
 
+	// =========================================================================
+	// Image attachments
+	// =========================================================================
+
+	/**
+	 * Add an image attachment. Returns the index of the added image.
+	 */
+	addImageAttachment(image: EditorImageAttachment): number {
+		this.imageAttachments.push(image);
+		return this.imageAttachments.length - 1;
+	}
+
+	/**
+	 * Remove an image attachment by index.
+	 */
+	removeImageAttachment(index: number): void {
+		if (index >= 0 && index < this.imageAttachments.length) {
+			this.imageAttachments.splice(index, 1);
+		}
+	}
+
+	/**
+	 * Get all image attachments and clear them (for submit).
+	 */
+	takeImageAttachments(): EditorImageAttachment[] {
+		const images = this.imageAttachments;
+		this.imageAttachments = [];
+		return images;
+	}
+
+	/**
+	 * Get current image attachments (read-only peek).
+	 */
+	getImageAttachments(): readonly EditorImageAttachment[] {
+		return this.imageAttachments;
+	}
+
 	/**
 	 * Internal text insertion at cursor. Handles single and multi-line text.
 	 * Does not push undo snapshots or trigger autocomplete - caller is responsible.
@@ -1116,6 +1169,9 @@ export class Editor implements Component, Focusable {
 			result = result.replace(markerRegex, pasteContent);
 		}
 
+		// Take image attachments before clearing state
+		const images = this.takeImageAttachments();
+
 		this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
 		this.pastes.clear();
 		this.pasteCounter = 0;
@@ -1125,7 +1181,7 @@ export class Editor implements Component, Focusable {
 		this.lastAction = null;
 
 		this.emitChange();
-		if (this.onSubmit) this.onSubmit(result);
+		if (this.onSubmit) this.onSubmit(result, images);
 	}
 
 	private handleBackspace(): void {

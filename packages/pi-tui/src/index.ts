@@ -21,7 +21,7 @@ export { Spacer } from "./components/spacer.js";
 export { Text } from "./components/text.js";
 export { TruncatedText } from "./components/truncated-text.js";
 // Editor component interface (for custom editors)
-export type { EditorComponent } from "./editor-component.js";
+export type { EditorComponent, EditorImageAttachment } from "./editor-component.js";
 // Fuzzy matching
 export { type FuzzyMatch, fuzzyFilter, fuzzyMatch } from "./fuzzy.js";
 // Keybindings

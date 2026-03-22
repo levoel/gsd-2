@@ -1,6 +1,16 @@
 import type { AutocompleteProvider } from "./autocomplete.js";
 import type { Component } from "./tui.js";
 
+/** Lightweight image attachment stored in the editor. */
+export interface EditorImageAttachment {
+	/** base64-encoded image data */
+	data: string;
+	/** MIME type, e.g. "image/png" */
+	mimeType: string;
+	/** Human-readable size label, e.g. "142KB" */
+	sizeLabel: string;
+}
+
 /**
  * Interface for custom editor components.
  *
@@ -26,8 +36,8 @@ export interface EditorComponent extends Component {
 	// Callbacks (required)
 	// =========================================================================
 
-	/** Called when user submits (e.g., Enter key) */
-	onSubmit?: (text: string) => void;
+	/** Called when user submits (e.g., Enter key). Images are attached clipboard images, if any. */
+	onSubmit?: (text: string, images?: EditorImageAttachment[]) => void;
 
 	/** Called when text changes */
 	onChange?: (text: string) => void;
@@ -71,4 +81,20 @@ export interface EditorComponent extends Component {
 
 	/** Set max visible items in autocomplete dropdown */
 	setAutocompleteMaxVisible?(maxVisible: number): void;
+
+	// =========================================================================
+	// Image attachments (optional)
+	// =========================================================================
+
+	/** Add an image attachment. Returns the index of the added image. */
+	addImageAttachment?(image: EditorImageAttachment): number;
+
+	/** Remove an image attachment by index. */
+	removeImageAttachment?(index: number): void;
+
+	/** Get all image attachments and clear them (for submit). */
+	takeImageAttachments?(): EditorImageAttachment[];
+
+	/** Get current image attachments (read-only peek). */
+	getImageAttachments?(): readonly EditorImageAttachment[];
 }

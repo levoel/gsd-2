@@ -1931,15 +1931,30 @@ export class InteractiveMode {
 				return;
 			}
 
-			// Write to temp file
-			const tmpDir = os.tmpdir();
+			// Convert to base64 and attach to editor
+			const base64Data = Buffer.from(image.bytes).toString("base64");
+			const sizeBytes = image.bytes.length;
+			const sizeLabel = sizeBytes >= 1024 * 1024
+				? `${(sizeBytes / (1024 * 1024)).toFixed(1)}MB`
+				: `${Math.ceil(sizeBytes / 1024)}KB`;
 			const ext = extensionForImageMimeType(image.mimeType) ?? "png";
-			const fileName = `pi-clipboard-${crypto.randomUUID()}.${ext}`;
-			const filePath = path.join(tmpDir, fileName);
-			fs.writeFileSync(filePath, Buffer.from(image.bytes));
 
-			// Insert file path directly
-			this.editor.insertTextAtCursor?.(filePath);
+			if (this.editor.addImageAttachment) {
+				this.editor.addImageAttachment({
+					data: base64Data,
+					mimeType: image.mimeType,
+					sizeLabel,
+				});
+				// Insert a visual marker in the text
+				this.editor.insertTextAtCursor?.(`📎 image.${ext} (${sizeLabel})`);
+			} else {
+				// Fallback for editors without image support: write temp file and insert path
+				const tmpDir = os.tmpdir();
+				const fileName = `pi-clipboard-${crypto.randomUUID()}.${ext}`;
+				const filePath = path.join(tmpDir, fileName);
+				fs.writeFileSync(filePath, Buffer.from(image.bytes));
+				this.editor.insertTextAtCursor?.(filePath);
+			}
 			this.ui.requestRender();
 		} catch {
 			// Silently ignore clipboard errors (may not have permission, etc.)
@@ -2342,7 +2357,13 @@ export class InteractiveMode {
 
 	private async handleFollowUp(): Promise<void> {
 		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
-		if (!text) return;
+		// Take any pending image attachments
+		const imageAttachments = this.editor.takeImageAttachments?.() ?? [];
+		const images = imageAttachments.length > 0
+			? imageAttachments.map((a) => ({ type: "image" as const, data: a.data, mimeType: a.mimeType }))
+			: undefined;
+
+		if (!text && !images) return;
 
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
@@ -2361,13 +2382,13 @@ export class InteractiveMode {
 		if (this.session.isStreaming) {
 			this.editor.addToHistory?.(text);
 			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
+			await this.session.prompt(text, { streamingBehavior: "followUp", images });
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}
 		// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
 		else if (this.editor.onSubmit) {
-			this.editor.onSubmit(text);
+			this.editor.onSubmit(text, imageAttachments.length > 0 ? imageAttachments : undefined);
 		}
 	}
 

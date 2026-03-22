@@ -1,5 +1,27 @@
+import type { ImageContent } from "@gsd/pi-ai";
+import type { EditorImageAttachment } from "@gsd/pi-tui";
 import { dispatchSlashCommand } from "../slash-command-handlers.js";
 import type { InteractiveModeStateHost } from "../interactive-mode-state.js";
+
+/**
+ * Convert EditorImageAttachments to ImageContent for the agent API.
+ */
+function toImageContent(attachments: EditorImageAttachment[]): ImageContent[] | undefined {
+	if (attachments.length === 0) return undefined;
+	return attachments.map((a) => ({
+		type: "image" as const,
+		data: a.data,
+		mimeType: a.mimeType,
+	}));
+}
+
+/**
+ * Strip image marker text (📎 image.xxx (xxxKB)) from prompt text
+ * so the LLM only sees the actual user message.
+ */
+function stripImageMarkers(text: string): string {
+	return text.replace(/📎\s*image\.\w+\s*\(\d+(?:\.\d+)?[KMG]B\)/g, "").trim();
+}
 
 export function setupEditorSubmitHandler(host: InteractiveModeStateHost & {
 	getSlashCommandContext: () => any;
@@ -13,9 +35,22 @@ export function setupEditorSubmitHandler(host: InteractiveModeStateHost & {
 	flushPendingBashComponents: () => void;
 	options?: { submitPromptsDirectly?: boolean };
 }): void {
-	host.defaultEditor.onSubmit = async (text: string) => {
+	host.defaultEditor.onSubmit = async (text: string, imageAttachments?: EditorImageAttachment[]) => {
 		text = text.trim();
-		if (!text) return;
+		const images = toImageContent(imageAttachments ?? []);
+
+		// Strip image markers from text so the LLM doesn't see them
+		if (images) {
+			text = stripImageMarkers(text);
+		}
+
+		// Allow image-only submissions (no text required when images are attached)
+		if (!text && !images) return;
+
+		// Use a default prompt when only images are attached
+		if (!text && images) {
+			text = "What do you see in this image?";
+		}
 
 		if (text.startsWith("/")) {
 			const handled = await dispatchSlashCommand(text, host.getSlashCommandContext());
@@ -46,7 +81,7 @@ export function setupEditorSubmitHandler(host: InteractiveModeStateHost & {
 			if (host.isExtensionCommand(text)) {
 				host.editor.addToHistory?.(text);
 				host.editor.setText("");
-				await host.session.prompt(text);
+				await host.session.prompt(text, { images });
 			} else {
 				host.queueCompactionMessage(text, "steer");
 			}
@@ -56,7 +91,7 @@ export function setupEditorSubmitHandler(host: InteractiveModeStateHost & {
 		if (host.session.isStreaming) {
 			host.editor.addToHistory?.(text);
 			host.editor.setText("");
-			await host.session.prompt(text, { streamingBehavior: "steer" });
+			await host.session.prompt(text, { streamingBehavior: "steer", images });
 			host.updatePendingMessagesDisplay();
 			host.ui.requestRender();
 			return;
@@ -73,7 +108,7 @@ export function setupEditorSubmitHandler(host: InteractiveModeStateHost & {
 		if (host.options?.submitPromptsDirectly) {
 			host.editor.addToHistory?.(text);
 			try {
-				await host.session.prompt(text);
+				await host.session.prompt(text, { images });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				host.showError(errorMessage);
