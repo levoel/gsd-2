@@ -18,7 +18,7 @@ import type {
 } from "../auto-verification.js";
 import type { DispatchAction } from "../auto-dispatch.js";
 import type { WorktreeResolver } from "../worktree-resolver.js";
-import type { CmuxLogLevel } from "../../cmux/index.js";
+import type { CmuxLogLevel, CmuxSyncContext } from "../../cmux/index.js";
 import type { JournalEntry } from "../journal.js";
 
 /**
@@ -44,7 +44,7 @@ export interface LoopDeps {
     unitId: string,
     state: GSDState,
   ) => void;
-  syncCmuxSidebar: (preferences: GSDPreferences | undefined, state: GSDState) => void;
+  syncCmuxSidebar: (preferences: GSDPreferences | undefined, state: GSDState, syncCtx?: CmuxSyncContext) => void;
   logCmuxEvent: (
     preferences: GSDPreferences | undefined,
     message: string,

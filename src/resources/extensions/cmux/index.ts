@@ -9,6 +9,7 @@ import type { GSDState, Phase } from "../gsd/types.js";
 const execFileAsync = promisify(execFile);
 const DEFAULT_SOCKET_PATH = "/tmp/cmux.sock";
 const STATUS_KEY = "gsd";
+const COST_STATUS_KEY = "gsd-cost";
 const lastSidebarSnapshots = new Map<string, string>();
 let cmuxPromptedThisSession = false;
 let cachedCliAvailability: boolean | null = null;
@@ -116,7 +117,7 @@ export function emitOsc777Notification(title: string, body: string): void {
   process.stdout.write(`\x1b]777;notify;${safeTitle};${safeBody}\x07`);
 }
 
-export function buildCmuxStatusLabel(state: GSDState): string {
+export function buildCmuxStatusLabel(state: GSDState, elapsedMs?: number): string {
   const parts: string[] = [];
   if (state.activeMilestone) parts.push(state.activeMilestone.id);
   if (state.activeSlice) parts.push(state.activeSlice.id);
@@ -125,7 +126,26 @@ export function buildCmuxStatusLabel(state: GSDState): string {
     parts.push(prev ? `${prev}/${state.activeTask.id}` : state.activeTask.id);
   }
   if (parts.length === 0) return state.phase;
-  return `${parts.join(" ")} · ${state.phase}`;
+  // Elapsed time is more useful than phase text — phase is already
+  // conveyed by the pill icon/color via phaseVisuals().
+  const suffix = elapsedMs != null && elapsedMs > 0
+    ? formatElapsedCompact(elapsedMs)
+    : state.phase;
+  return `${parts.join(" ")} · ${suffix}`;
+}
+
+/**
+ * Compact elapsed formatter for sidebar pills.
+ * ≤ 59s → "42s", ≤ 59m → "12m", ≥ 1h → "1h 23m"
+ */
+export function formatElapsedCompact(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const m = Math.floor(totalSeconds / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm > 0 ? `${h}h ${rm}m` : `${h}h`;
 }
 
 export function buildCmuxProgress(state: GSDState): CmuxSidebarProgress | null {
@@ -250,6 +270,26 @@ export class CmuxClient {
     this.runSync(this.appendWorkspace(["clear-status", STATUS_KEY]));
   }
 
+  setCost(totalCost: number, totalTokens: number): void {
+    if (!this.config.sidebar) return;
+    const costStr = formatCostCompact(totalCost);
+    const tokStr = formatTokensCompact(totalTokens);
+    this.runSync(this.appendWorkspace([
+      "set-status",
+      COST_STATUS_KEY,
+      `${costStr} · ${tokStr}`,
+      "--icon",
+      "dollar-sign",
+      "--color",
+      "#a78bfa",
+    ]));
+  }
+
+  clearCost(): void {
+    if (!this.config.sidebar) return;
+    this.runSync(this.appendWorkspace(["clear-status", COST_STATUS_KEY]));
+  }
+
   setProgress(progress: CmuxSidebarProgress | null): void {
     if (!this.config.sidebar) return;
     if (!progress) {
@@ -366,19 +406,37 @@ export class CmuxClient {
   }
 }
 
-export function syncCmuxSidebar(preferences: GSDPreferences | undefined, state: GSDState): void {
+export interface CmuxSyncContext {
+  totalCost?: number;
+  totalTokens?: number;
+  elapsedMs?: number;
+}
+
+export function syncCmuxSidebar(
+  preferences: GSDPreferences | undefined,
+  state: GSDState,
+  syncCtx?: CmuxSyncContext,
+): void {
   const client = CmuxClient.fromPreferences(preferences);
   const config = client.getConfig();
   if (!config.sidebar) return;
 
-  const label = buildCmuxStatusLabel(state);
+  const label = buildCmuxStatusLabel(state, syncCtx?.elapsedMs);
   const progress = buildCmuxProgress(state);
-  const snapshot = JSON.stringify({ label, progress, phase: state.phase });
+  const cost = syncCtx?.totalCost ?? 0;
+  const tokens = syncCtx?.totalTokens ?? 0;
+  const snapshot = JSON.stringify({ label, progress, phase: state.phase, cost, tokens });
   const key = sidebarSnapshotKey(config);
   if (lastSidebarSnapshots.get(key) === snapshot) return;
 
   client.setStatus(label, state.phase);
   client.setProgress(progress);
+
+  // Cost pill — only show once there's a nonzero spend
+  if (cost > 0) {
+    client.setCost(cost, tokens);
+  }
+
   lastSidebarSnapshots.set(key, snapshot);
 }
 
@@ -388,6 +446,7 @@ export function clearCmuxSidebar(preferences: GSDPreferences | undefined): void 
   const client = new CmuxClient({ ...config, enabled: true, sidebar: true });
   const key = sidebarSnapshotKey(config);
   client.clearStatus();
+  client.clearCost();
   client.setProgress(null);
   lastSidebarSnapshots.delete(key);
 }
@@ -402,6 +461,27 @@ export function logCmuxEvent(
 
 export function shellEscape(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Compact cost formatter for sidebar pills.
+ * < $0.01 → "$0.003", < $1 → "$0.42", ≥ $1 → "$4.20"
+ */
+export function formatCostCompact(cost: number): string {
+  const n = Number(cost) || 0;
+  if (n < 0.01) return `$${n.toFixed(3)}`;
+  if (n < 1) return `$${n.toFixed(2)}`;
+  return `$${n.toFixed(2)}`;
+}
+
+/**
+ * Compact token formatter for sidebar pills.
+ * < 1k → "420", < 1M → "48.2k", ≥ 1M → "1.20M"
+ */
+export function formatTokensCompact(count: number): string {
+  if (count < 1000) return `${count}`;
+  if (count < 1_000_000) return `${(count / 1000).toFixed(1)}k`;
+  return `${(count / 1_000_000).toFixed(2)}M`;
 }
 
 function normalizeNotificationText(value: string): string {

@@ -7,6 +7,9 @@ import {
   buildCmuxProgress,
   buildCmuxStatusLabel,
   detectCmuxEnvironment,
+  formatCostCompact,
+  formatElapsedCompact,
+  formatTokensCompact,
   markCmuxPromptShown,
   resetCmuxPromptState,
   resolveCmuxConfig,
@@ -98,6 +101,55 @@ test("buildCmuxStatusLabel and progress prefer deepest active unit", () => {
 
   assert.equal(buildCmuxStatusLabel(state), "M001 S02/T03 · executing");
   assert.deepEqual(buildCmuxProgress(state), { value: 0.4, label: "2/5 tasks" });
+});
+
+test("buildCmuxStatusLabel shows elapsed time when provided", () => {
+  const state: GSDState = {
+    activeMilestone: { id: "M001", title: "Milestone" },
+    activeSlice: { id: "S02", title: "Slice" },
+    activeTask: { id: "T03", title: "Task" },
+    phase: "executing",
+    recentDecisions: [],
+    blockers: [],
+    nextAction: "Keep going",
+    registry: [],
+  };
+
+  // With elapsed time
+  assert.equal(buildCmuxStatusLabel(state, 42_000), "M001 S02/T03 · 42s");
+  assert.equal(buildCmuxStatusLabel(state, 720_000), "M001 S02/T03 · 12m");
+  assert.equal(buildCmuxStatusLabel(state, 5_400_000), "M001 S02/T03 · 1h 30m");
+
+  // Without elapsed → falls back to phase
+  assert.equal(buildCmuxStatusLabel(state), "M001 S02/T03 · executing");
+  assert.equal(buildCmuxStatusLabel(state, 0), "M001 S02/T03 · executing");
+  assert.equal(buildCmuxStatusLabel(state, undefined), "M001 S02/T03 · executing");
+});
+
+test("formatElapsedCompact covers all ranges", () => {
+  assert.equal(formatElapsedCompact(0), "0s");
+  assert.equal(formatElapsedCompact(42_000), "42s");
+  assert.equal(formatElapsedCompact(59_000), "59s");
+  assert.equal(formatElapsedCompact(60_000), "1m");
+  assert.equal(formatElapsedCompact(720_000), "12m");
+  assert.equal(formatElapsedCompact(3_600_000), "1h");
+  assert.equal(formatElapsedCompact(5_400_000), "1h 30m");
+});
+
+test("formatCostCompact formats cost for sidebar pills", () => {
+  assert.equal(formatCostCompact(0), "$0.000");
+  assert.equal(formatCostCompact(0.003), "$0.003");
+  assert.equal(formatCostCompact(0.42), "$0.42");
+  assert.equal(formatCostCompact(4.2), "$4.20");
+  assert.equal(formatCostCompact(12.345), "$12.35");
+});
+
+test("formatTokensCompact formats token counts for sidebar pills", () => {
+  assert.equal(formatTokensCompact(0), "0");
+  assert.equal(formatTokensCompact(420), "420");
+  assert.equal(formatTokensCompact(1000), "1.0k");
+  assert.equal(formatTokensCompact(48_200), "48.2k");
+  assert.equal(formatTokensCompact(1_200_000), "1.20M");
 });
 
 describe("createGridLayout", () => {

@@ -29,6 +29,61 @@ import { atomicWriteSync } from "../atomic-write.js";
 import { PROJECT_FILES } from "../detection.js";
 import { join } from "node:path";
 
+// ─── Cmux sidebar log formatters ────────────────────────────────────────────
+
+/** Human-readable label for a unit type in sidebar log entries. */
+function unitTypeLabel(unitType: string): string {
+  if (unitType.startsWith("hook/")) return `hook: ${unitType.slice(5)}`;
+  switch (unitType) {
+    case "research-milestone": return "research";
+    case "plan-milestone": return "plan";
+    case "research-slice": return "research";
+    case "plan-slice": return "plan";
+    case "execute-task": return "execute";
+    case "complete-slice": return "complete";
+    case "reassess-roadmap": return "reassess";
+    case "replan-slice": return "replan";
+    case "triage-captures": return "triage";
+    case "quick-task": return "quick";
+    case "custom-step": return "step";
+    default: return unitType;
+  }
+}
+
+/**
+ * Format a sidebar log message for a unit starting.
+ * e.g. "S02/T03 — executing" or "M001 — researching"
+ */
+function formatUnitStartLog(unitType: string, unitId: string): string {
+  return `${unitId} — ${unitTypeLabel(unitType)}`;
+}
+
+/**
+ * Format a sidebar log message for a unit completing.
+ * e.g. "S02/T03 — done (3m, $0.42)" or "M001 — done (12m)"
+ */
+function formatUnitDoneLog(
+  unitType: string,
+  unitId: string,
+  durationMs: number,
+  cost?: number,
+): string {
+  const dur = formatDurationCompact(durationMs);
+  const costStr = cost != null && cost > 0 ? `, $${cost < 1 ? cost.toFixed(2) : cost.toFixed(2)}` : "";
+  return `${unitId} — done (${dur}${costStr})`;
+}
+
+/** Compact duration: "42s" | "3m" | "1h 12m" */
+function formatDurationCompact(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm > 0 ? `${h}h ${rm}m` : `${h}h`;
+}
+
 // ─── generateMilestoneReport ──────────────────────────────────────────────────
 
 /**
@@ -181,7 +236,16 @@ export async function runPreDispatch(
 
   // Derive state
   let state = await deps.deriveState(s.basePath);
-  deps.syncCmuxSidebar(prefs, state);
+
+  // Build cost/elapsed context for cmux sidebar
+  const ledger = deps.getLedger() as { units: unknown } | null;
+  const totals = ledger ? deps.getProjectTotals(ledger.units) : null;
+  const elapsedMs = s.autoStartTime > 0 ? Date.now() - s.autoStartTime : undefined;
+  deps.syncCmuxSidebar(prefs, state, {
+    totalCost: totals?.cost,
+    totalTokens: (totals as { tokens?: { total?: number } } | null)?.tokens?.total,
+    elapsedMs,
+  });
   let mid = state.activeMilestone?.id;
   let midTitle = state.activeMilestone?.title;
   debugLog("autoLoop", {
@@ -856,6 +920,10 @@ export async function runUnitPhase(
   s.currentUnit = { type: unitType, id: unitId, startedAt: Date.now() };
   const unitStartSeq = ic.nextSeq();
   deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: unitStartSeq, eventType: "unit-start", data: { unitType, unitId } });
+
+  // Sidebar lifecycle log — show what unit is starting
+  deps.logCmuxEvent(prefs, formatUnitStartLog(unitType, unitId), "progress");
+
   deps.captureAvailableSkills();
   deps.writeUnitRuntimeRecord(
     s.basePath,
@@ -1157,6 +1225,16 @@ export async function runUnitPhase(
     deps.clearUnitRuntimeRecord(s.basePath, unitType, unitId);
     s.unitDispatchCount.delete(`${unitType}/${unitId}`);
     s.unitRecoveryCount.delete(`${unitType}/${unitId}`);
+
+    // Sidebar lifecycle log — unit completed with cost/duration
+    const unitDurationMs = Date.now() - s.currentUnit.startedAt;
+    const currentLedgerForLog = deps.getLedger() as { units: Array<{ type: string; id: string; startedAt: number; cost: number }> } | null;
+    const unitCost = currentLedgerForLog?.units
+      ? [...currentLedgerForLog.units].reverse().find(
+        (u) => u.type === unitType && u.id === unitId && u.startedAt === s.currentUnit!.startedAt,
+      )?.cost
+      : undefined;
+    deps.logCmuxEvent(prefs, formatUnitDoneLog(unitType, unitId, unitDurationMs, unitCost), "success");
   }
 
   deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "unit-end", data: { unitType, unitId, status: unitResult.status, artifactVerified }, causedBy: { flowId: ic.flowId, seq: unitStartSeq } });

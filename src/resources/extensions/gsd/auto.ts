@@ -189,7 +189,7 @@ import {
 } from "./auto-supervisor.js";
 import { isDbAvailable } from "./gsd-db.js";
 import { countPendingCaptures } from "./captures.js";
-import { clearCmuxSidebar, logCmuxEvent, syncCmuxSidebar } from "../cmux/index.js";
+import { clearCmuxSidebar, logCmuxEvent, syncCmuxSidebar, type CmuxSyncContext } from "../cmux/index.js";
 
 // ── Extracted modules ──────────────────────────────────────────────────────
 import { startUnitSupervision } from "./auto-timers.js";
@@ -345,6 +345,20 @@ export function getAutoDashboardData(): AutoDashboardData {
     totalCost: totals?.cost ?? 0,
     totalTokens: totals?.tokens.total ?? 0,
     pendingCaptureCount,
+  };
+}
+
+/**
+ * Build a CmuxSyncContext from current auto-mode session state.
+ * Used by syncCmuxSidebar call sites outside the main loop (start, resume).
+ */
+function buildSyncContext(): CmuxSyncContext {
+  const ledger = getLedger();
+  const totals = ledger ? getProjectTotals(ledger.units) : null;
+  return {
+    totalCost: totals?.cost,
+    totalTokens: (totals as { tokens?: { total?: number } } | null)?.tokens?.total,
+    elapsedMs: s.autoStartTime > 0 ? Date.now() - s.autoStartTime : undefined,
   };
 }
 
@@ -1121,7 +1135,7 @@ export async function startAuto(
     restoreHookState(s.basePath);
     try {
       await rebuildState(s.basePath);
-      syncCmuxSidebar(loadEffectiveGSDPreferences()?.preferences, await deriveState(s.basePath));
+      syncCmuxSidebar(loadEffectiveGSDPreferences()?.preferences, await deriveState(s.basePath), buildSyncContext());
     } catch (e) {
       debugLog("resume-rebuild-state-failed", {
         error: e instanceof Error ? e.message : String(e),
@@ -1212,7 +1226,7 @@ export async function startAuto(
   if (!ready) return;
 
   try {
-    syncCmuxSidebar(loadEffectiveGSDPreferences()?.preferences, await deriveState(s.basePath));
+    syncCmuxSidebar(loadEffectiveGSDPreferences()?.preferences, await deriveState(s.basePath), buildSyncContext());
   } catch {
     // Best-effort only — sidebar sync must never block auto-mode startup
   }
