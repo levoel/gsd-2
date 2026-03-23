@@ -14,6 +14,34 @@ const lastSidebarSnapshots = new Map<string, string>();
 let cmuxPromptedThisSession = false;
 let cachedCliAvailability: boolean | null = null;
 
+// ── Singleton client cache ────────────────────────────────────────────────────
+// Avoids re-resolving config and re-creating CmuxClient on every sidebar/log call.
+let cachedClient: CmuxClient | null = null;
+let cachedClientKey: string | null = null;
+
+function getCachedClient(preferences: GSDPreferences | undefined): CmuxClient {
+  const config = resolveCmuxConfig(preferences);
+  const key = `${config.enabled}:${config.sidebar}:${config.notifications}:${config.splits}:${config.workspaceId ?? ""}`;
+  if (cachedClient && cachedClientKey === key) return cachedClient;
+  cachedClient = new CmuxClient(config);
+  cachedClientKey = key;
+  return cachedClient;
+}
+
+/** Invalidate the cached client (e.g. after preferences change). */
+export function invalidateCmuxClientCache(): void {
+  cachedClient = null;
+  cachedClientKey = null;
+}
+
+// ── Sidebar sync throttle ─────────────────────────────────────────────────────
+// Leading-edge + trailing-edge throttle: executes immediately on first call,
+// then coalesces rapid updates and flushes the latest state after THROTTLE_MS.
+const SIDEBAR_THROTTLE_MS = 500;
+let lastSyncTime = 0;
+let pendingSync: [GSDPreferences | undefined, GSDState, CmuxSyncContext?] | null = null;
+let syncTimer: ReturnType<typeof setTimeout> | null = null;
+
 export interface CmuxEnvironment {
   available: boolean;
   cliAvailable: boolean;
@@ -214,6 +242,10 @@ export class CmuxClient {
     return surfaceId ? [...args, "--surface", surfaceId] : args;
   }
 
+  /**
+   * Synchronous exec — used only for operations where the caller needs the
+   * result (getCapabilities, identify, notify). Avoid in hot paths.
+   */
   private runSync(args: string[]): string | null {
     if (!this.canRun()) return null;
     try {
@@ -241,6 +273,23 @@ export class CmuxClient {
     }
   }
 
+  /**
+   * Fire-and-forget async exec — spawns the process without blocking the
+   * event loop or waiting for the result. Used for sidebar updates, logging,
+   * and other non-critical writes where we don't need the output.
+   */
+  private fireAndForget(args: string[]): void {
+    if (!this.canRun()) return;
+    const child = execFile("cmux", args, {
+      encoding: "utf-8",
+      timeout: 5000,
+      env: process.env,
+    });
+    // Detach: swallow errors, unref so it doesn't keep the process alive.
+    child.on("error", () => {});
+    child.unref();
+  }
+
   getCapabilities(): unknown | null {
     const stdout = this.runSync(["capabilities", "--json"]);
     return stdout ? parseJson(stdout) : null;
@@ -254,7 +303,7 @@ export class CmuxClient {
   setStatus(label: string, phase: Phase): void {
     if (!this.config.sidebar) return;
     const visuals = phaseVisuals(phase);
-    this.runSync(this.appendWorkspace([
+    this.fireAndForget(this.appendWorkspace([
       "set-status",
       STATUS_KEY,
       label,
@@ -267,14 +316,14 @@ export class CmuxClient {
 
   clearStatus(): void {
     if (!this.config.sidebar) return;
-    this.runSync(this.appendWorkspace(["clear-status", STATUS_KEY]));
+    this.fireAndForget(this.appendWorkspace(["clear-status", STATUS_KEY]));
   }
 
   setCost(totalCost: number, totalTokens: number): void {
     if (!this.config.sidebar) return;
     const costStr = formatCostCompact(totalCost);
     const tokStr = formatTokensCompact(totalTokens);
-    this.runSync(this.appendWorkspace([
+    this.fireAndForget(this.appendWorkspace([
       "set-status",
       COST_STATUS_KEY,
       `${costStr} · ${tokStr}`,
@@ -287,16 +336,16 @@ export class CmuxClient {
 
   clearCost(): void {
     if (!this.config.sidebar) return;
-    this.runSync(this.appendWorkspace(["clear-status", COST_STATUS_KEY]));
+    this.fireAndForget(this.appendWorkspace(["clear-status", COST_STATUS_KEY]));
   }
 
   setProgress(progress: CmuxSidebarProgress | null): void {
     if (!this.config.sidebar) return;
     if (!progress) {
-      this.runSync(this.appendWorkspace(["clear-progress"]));
+      this.fireAndForget(this.appendWorkspace(["clear-progress"]));
       return;
     }
-    this.runSync(this.appendWorkspace([
+    this.fireAndForget(this.appendWorkspace([
       "set-progress",
       progress.value.toFixed(3),
       "--label",
@@ -306,7 +355,7 @@ export class CmuxClient {
 
   log(message: string, level: CmuxLogLevel = "info", source = "gsd"): void {
     if (!this.config.sidebar) return;
-    this.runSync(this.appendWorkspace([
+    this.fireAndForget(this.appendWorkspace([
       "log",
       "--level",
       level,
@@ -321,6 +370,7 @@ export class CmuxClient {
     if (!this.config.notifications) return false;
     const args = ["notify", "--title", title, "--body", body];
     if (subtitle) args.push("--subtitle", subtitle);
+    // Notify stays sync — caller checks return value to decide OSC777 fallback.
     return this.runSync(args) !== null;
   }
 
@@ -412,12 +462,63 @@ export interface CmuxSyncContext {
   elapsedMs?: number;
 }
 
+/**
+ * Throttled sidebar sync — coalesces rapid updates.
+ *
+ * Leading-edge: first call after THROTTLE_MS executes immediately.
+ * Trailing-edge: if more calls arrive within the window, only the last
+ * state is flushed when the timer fires. This means at most 2 cmux process
+ * spawns per THROTTLE_MS window (one leading, one trailing) instead of N.
+ */
 export function syncCmuxSidebar(
   preferences: GSDPreferences | undefined,
   state: GSDState,
   syncCtx?: CmuxSyncContext,
 ): void {
-  const client = CmuxClient.fromPreferences(preferences);
+  const now = Date.now();
+  if (now - lastSyncTime >= SIDEBAR_THROTTLE_MS) {
+    // Leading edge — enough time has passed, sync immediately.
+    lastSyncTime = now;
+    doSyncCmuxSidebar(preferences, state, syncCtx);
+  } else {
+    // Within throttle window — stash for trailing flush.
+    pendingSync = [preferences, state, syncCtx];
+    if (!syncTimer) {
+      const remaining = SIDEBAR_THROTTLE_MS - (now - lastSyncTime);
+      syncTimer = setTimeout(() => {
+        syncTimer = null;
+        if (pendingSync) {
+          lastSyncTime = Date.now();
+          doSyncCmuxSidebar(...pendingSync);
+          pendingSync = null;
+        }
+      }, remaining);
+      syncTimer.unref();
+    }
+  }
+}
+
+/**
+ * Flush any pending throttled sidebar sync immediately (e.g. before shutdown).
+ */
+export function flushCmuxSidebar(): void {
+  if (syncTimer) {
+    clearTimeout(syncTimer);
+    syncTimer = null;
+  }
+  if (pendingSync) {
+    doSyncCmuxSidebar(...pendingSync);
+    pendingSync = null;
+  }
+}
+
+/** Internal — performs the actual sidebar update using the cached client. */
+function doSyncCmuxSidebar(
+  preferences: GSDPreferences | undefined,
+  state: GSDState,
+  syncCtx?: CmuxSyncContext,
+): void {
+  const client = getCachedClient(preferences);
   const config = client.getConfig();
   if (!config.sidebar) return;
 
@@ -441,6 +542,8 @@ export function syncCmuxSidebar(
 }
 
 export function clearCmuxSidebar(preferences: GSDPreferences | undefined): void {
+  // Flush any pending throttled update before clearing.
+  flushCmuxSidebar();
   const config = resolveCmuxConfig(preferences);
   if (!config.available || !config.cliAvailable) return;
   const client = new CmuxClient({ ...config, enabled: true, sidebar: true });
@@ -449,6 +552,29 @@ export function clearCmuxSidebar(preferences: GSDPreferences | undefined): void 
   client.clearCost();
   client.setProgress(null);
   lastSidebarSnapshots.delete(key);
+  invalidateCmuxClientCache();
+}
+
+// ── Log throttle ──────────────────────────────────────────────────────────────
+// Coalesces burst log events. Keeps at most MAX_QUEUED_LOGS and flushes them
+// after LOG_THROTTLE_MS. Error/warning logs bypass the throttle for immediacy.
+const LOG_THROTTLE_MS = 300;
+const MAX_QUEUED_LOGS = 8;
+let logQueue: Array<{ message: string; level: CmuxLogLevel }> = [];
+let logTimer: ReturnType<typeof setTimeout> | null = null;
+let logPrefsRef: GSDPreferences | undefined;
+
+function flushLogQueue(): void {
+  if (logTimer) {
+    clearTimeout(logTimer);
+    logTimer = null;
+  }
+  if (logQueue.length === 0) return;
+  const client = getCachedClient(logPrefsRef);
+  for (const entry of logQueue) {
+    client.log(entry.message, entry.level);
+  }
+  logQueue = [];
 }
 
 export function logCmuxEvent(
@@ -456,7 +582,25 @@ export function logCmuxEvent(
   message: string,
   level: CmuxLogLevel = "info",
 ): void {
-  CmuxClient.fromPreferences(preferences).log(message, level);
+  logPrefsRef = preferences;
+
+  // High-priority levels bypass the throttle.
+  if (level === "error" || level === "warning") {
+    // Flush queue first so ordering is preserved.
+    flushLogQueue();
+    getCachedClient(preferences).log(message, level);
+    return;
+  }
+
+  // Low-priority: queue and coalesce.
+  logQueue.push({ message, level });
+  if (logQueue.length > MAX_QUEUED_LOGS) {
+    logQueue.shift(); // Drop oldest to cap memory.
+  }
+  if (!logTimer) {
+    logTimer = setTimeout(flushLogQueue, LOG_THROTTLE_MS);
+    logTimer.unref();
+  }
 }
 
 export function shellEscape(value: string): string {
